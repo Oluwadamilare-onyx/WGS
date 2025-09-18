@@ -1,0 +1,271 @@
+name: sa_polony_wgs
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - fastqc
+  - multiqc
+  - fastp
+  - spades
+  - quast
+  - blast
+  - ncbi-blast
+  - kraken2
+  - samtools
+  - bwa
+  - mlst
+  - abricate
+  - r-base
+  - r-essentials
+  - pandas
+  - parallel
+  - bedtools
+  - wget
+  - git
+
+# Makefile to orchestrate pipeline
+SAMPLE_LIMIT ?= 50
+THREADS ?= 8
+MEM ?= 32
+
+.PHONY: all qc assemble abricate blast summarise
+
+all: qc assemble abricate blast summarise
+
+qc:
+	@echo "Running QC, trimming and assembly (limit=$(SAMPLE_LIMIT))"
+	./scripts/run_qc_trim_assemble.sh $(SAMPLE_LIMIT) $(THREADS) $(MEM)
+
+assemble: qc
+	@echo "Assemblies should be in results/spades/"
+
+abricate:
+	@echo "Running abricate (ResFinder, CARD, VFDB)"
+	./scripts/run_abricate.sh
+
+blast:
+	@echo "Running BLAST species confirmation"
+	./scripts/run_blast_species_id.sh
+
+summarise:
+	@echo "Summarise abricate outputs"
+	./scripts/summarise_abricate.sh
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Usage: run_qc_trim_assemble.sh SAMPLE_LIMIT THREADS MEM
+SAMPLE_LIMIT=${1:-50}
+THREADS=${2:-8}
+MEM=${3:-32}
+
+FASTQ_DIR="fastq"
+OUTDIR="results"
+TRIM_DIR="${OUTDIR}/trimmed"
+SPADES_DIR="${OUTDIR}/spades"
+FASTQC_DIR="${OUTDIR}/fastqc"
+QUAST_DIR="${OUTDIR}/quast"
+
+mkdir -p "${OUTDIR}" "${TRIM_DIR}" "${SPADES_DIR}" "${FASTQC_DIR}" "${QUAST_DIR}"
+
+# build sample list by prefix before _R1
+# adapt pattern if your fastq filenames differ
+ls ${FASTQ_DIR}/*_R1*.fastq.gz 2>/dev/null | sed -E 's/(.*)\/(.*)(_R1.*)/\2/' | sort -u | head -n ${SAMPLE_LIMIT} > sample_list.txt
+
+if [[ ! -s sample_list.txt ]]; then
+  echo "No fastq files found in ${FASTQ_DIR}. Exiting."
+  exit 1
+fi
+
+export FASTQ_DIR OUTDIR TRIM_DIR SPADES_DIR FASTQC_DIR QUAST_DIR THREADS MEM
+
+run_sample() {
+  sample="$1"
+  echo "=== Processing ${sample} ==="
+  r1="${FASTQ_DIR}/${sample}_R1_001.fastq.gz"
+  r2="${FASTQ_DIR}/${sample}_R2_001.fastq.gz"
+
+  # fallback: try less strict names if not found
+  if [[ ! -f "${r1}" ]]; then
+    r1=$(ls ${FASTQ_DIR}/${sample}*R1* 2>/dev/null | head -n1 || true)
+  fi
+  if [[ ! -f "${r2}" ]]; then
+    r2=$(ls ${FASTQ_DIR}/${sample}*R2* 2>/dev/null | head -n1 || true)
+  fi
+
+  if [[ -z "${r1}" || -z "${r2}" ]]; then
+    echo "Skipping ${sample}: R1/R2 not found."
+    return
+  fi
+
+  # FastQC
+  fastqc -o "${FASTQC_DIR}" -t 2 "${r1}" "${r2}" || true
+
+  # Trim
+  fastp -i "${r1}" -I "${r2}" \
+    -o "${TRIM_DIR}/${sample}_R1.trim.fastq.gz" \
+    -O "${TRIM_DIR}/${sample}_R2.trim.fastq.gz" \
+    -h "${TRIM_DIR}/${sample}_fastp.html" \
+    -j "${TRIM_DIR}/${sample}_fastp.json" -w 2 || true
+
+  # SPAdes assembly (careful mode)
+  mkdir -p "${SPADES_DIR}/${sample}"
+  spades.py --careful -1 "${TRIM_DIR}/${sample}_R1.trim.fastq.gz" -2 "${TRIM_DIR}/${sample}_R2.trim.fastq.gz" -o "${SPADES_DIR}/${sample}" -t ${THREADS} -m ${MEM} || true
+
+  # Quast summary
+  if [[ -f "${SPADES_DIR}/${sample}/contigs.fasta" ]]; then
+    quast -o "${QUAST_DIR}/${sample}" "${SPADES_DIR}/${sample}/contigs.fasta" || true
+  fi
+}
+
+export -f run_sample
+
+# run in parallel (4 parallel by default, change to match CPU/RAM)
+cat sample_list.txt | xargs -I{} -n 1 -P 4 bash -c 'run_sample "$@"' _ {}
+
+echo "QC, trimming and assembly finished. Outputs at ${OUTDIR}/"
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTDIR="results"
+ABDIR="${OUTDIR}/abricate"
+ASM_DIR="${OUTDIR}/spades"
+
+mkdir -p "${ABDIR}"
+
+# Ensure DBs are set up (may take time)
+abricate --setupdb || true
+
+DBS=("resfinder" "card" "vfdb")
+
+for db in "${DBS[@]}"; do
+  echo "Running abricate db=${db}"
+  mkdir -p "${ABDIR}/${db}"
+  for asm in ${ASM_DIR}/*/contigs.fasta; do
+    sample=$(basename $(dirname "${asm}"))
+    out="${ABDIR}/${db}/${sample}.${db}.tab"
+    abricate --db "${db}" "${asm}" > "${out}" || true
+  done
+  # Summary for db
+  abricate --summary ${ABDIR}/${db}/*.${db}.tab > ${ABDIR}/${db}_summary.tsv || true
+done
+
+echo "Abricate finished. Results in ${ABDIR}/"
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTDIR="results"
+BLAST_DIR="${OUTDIR}/blast"
+ASM_DIR="${OUTDIR}/spades"
+REF_DIR="refs"
+mkdir -p "${BLAST_DIR}" "${REF_DIR}"
+
+# NOTE: You should place a Listeria reference FASTA in refs/ named lmono_ref.fna
+if [[ ! -f "${REF_DIR}/lmono_ref.fna" ]]; then
+  echo "Reference ${REF_DIR}/lmono_ref.fna not found."
+  echo "Download a Listeria monocytogenes reference genome into refs/lmono_ref.fna and re-run."
+  exit 1
+fi
+
+makeblastdb -in "${REF_DIR}/lmono_ref.fna" -dbtype nucl -out "${REF_DIR}/lmono_ref.db" || true
+
+for asm in ${ASM_DIR}/*/contigs.fasta; do
+  sample=$(basename $(dirname "${asm}"))
+  out="${BLAST_DIR}/${sample}.blastn.tsv"
+  blastn -query "${asm}" -db "${REF_DIR}/lmono_ref.db" -max_target_seqs 5 -outfmt '6 qseqid sseqid pident length qlen slen evalue bitscore' -num_threads 2 > "${out}" || true
+done
+
+echo "BLAST species confirmation finished. Results in ${BLAST_DIR}/"
+
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTDIR="results"
+ABDIR="${OUTDIR}/abricate"
+SUMDIR="${OUTDIR}/summary"
+mkdir -p "${SUMDIR}"
+
+# target genes (case-insensitive)
+TARGET_GENES=("hly" "plcA" "plcB" "prfA" "tet" "erm" "aac" "aph" "sul" "fosX" "bla" "van")
+
+# collect sample names from assemblies
+ls ${OUTDIR}/spades | sort > "${SUMDIR}/sample_names.txt"
+
+# header
+printf "sample" > "${SUMDIR}/gene_presence.csv"
+for g in "${TARGET_GENES[@]}"; do printf ",%s" "${g}" >> "${SUMDIR}/gene_presence.csv"; done
+printf "\n" >> "${SUMDIR}/gene_presence.csv"
+
+# iterate samples
+while read sample; do
+  printf "%s" "${sample}" >> "${SUMDIR}/gene_presence.csv"
+  for g in "${TARGET_GENES[@]}"; do
+    found=0
+    # search abricate folders for gene (case-insensitive)
+    if grep -i -R --line-number -w "${g}" "${ABDIR}" 2>/dev/null | grep -q .; then
+      found=1
+    fi
+    printf ",%s" "${found}" >> "${SUMDIR}/gene_presence.csv"
+  done
+  printf "\n" >> "${SUMDIR}/gene_presence.csv"
+done < "${SUMDIR}/sample_names.txt"
+
+# quick prevalence summary using python
+python - <<'PY'
+import pandas as pd
+df = pd.read_csv('results/summary/gene_presence.csv')
+cols = df.columns[1:]
+print('Samples:', len(df))
+prev = (df[cols].sum()/len(df))*100
+print('\nPrevalence (%) per gene:')
+print(prev.to_string())
+prev.to_csv('results/summary/gene_prevalence_pct.csv', header=['prevalence_pct'])
+PY
+
+echo "Summaries written to ${SUMDIR}/"
+
+
+
+# Analysis Report — South African Polony WGS (Listeria monocytogenes)
+
+## 1. Background
+Briefly describe outbreak (2017–2018), suspected food vehicle (polony), vulnerable groups (neonates, pregnant women, immunocompromised), case counts and importance of WGS.
+
+## 2. Methods
+- Data sources and sample set (n = X; downsampled to Y for analysis)
+- Software and versions (refer to environment.yml)
+- Pipeline steps:
+  - QC & trimming (fastp, FastQC, MultiQC)
+  - Assembly (SPAdes)
+  - Species confirmation (Kraken2 / BLAST)
+  - MLST
+  - AMR detection (Abricate: ResFinder, CARD)
+  - Virulence detection (Abricate: VFDB; genes: hly, plcA, plcB, prfA)
+  - Summaries and prevalence calculations
+
+## 3. Results
+- Species confirmation (counts; % L. monocytogenes; MLST results — ST distribution)
+- Assembly metrics summary (N50, total contig length)
+- AMR gene table (matrix or prevalence table)
+- Virulence gene presence (hly/plcA/plcB/prfA)
+- Interpretation (clustering/clonality notes; presence of toxin genes)
+
+## 4. Discussion
+- Clinical implications: recommend first-line antibiotics
+- Public-health implications: evidence for clonal outbreak, link to Enterprise Foods polony, regional export risk
+- Limitations (assembly-based detection, lack of phenotypic AST)
+
+## 5. Conclusions & Recommendations
+- Summary statements and practical next steps for lab & public health
+
+## 6. Supplementary
+- Scripts used, command logs, and CSV tables (gene_presence.csv, gene_prevalence_pct.csv)
+
+
